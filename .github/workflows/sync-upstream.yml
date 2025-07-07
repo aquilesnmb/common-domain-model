@@ -107,8 +107,8 @@ jobs:
         run: |
           echo "Triggering CDM ingestion webhook..."
           
-          # Prepare webhook payload
-          PAYLOAD=$(cat <<EOF
+          # Prepare webhook payload for API Gateway Lambda proxy integration
+          WEBHOOK_BODY=$(cat <<EOF
           {
             "action": "upstream_sync",
             "repository": {
@@ -122,12 +122,28 @@ jobs:
               "sync_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
               "sync_status": "${{ env.SYNC_STATUS }}"
             },
+            "before": "${{ env.FORK_COMMIT }}",
+            "after": "${{ env.UPSTREAM_COMMIT }}",
             "commits_synced": ${{ env.COMMIT_COUNT }},
             "sync_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "workflow_run": {
               "id": "${{ github.run_id }}",
               "number": "${{ github.run_number }}",
               "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+          }
+          EOF
+          )
+          
+          # Create API Gateway Lambda proxy event structure
+          PAYLOAD=$(cat <<EOF
+          {
+            "source": "webhook",
+            "body": $(echo "$WEBHOOK_BODY" | jq -c -R .),
+            "headers": {
+              "X-GitHub-Event": "sync",
+              "User-Agent": "GitHub-Actions-Sync",
+              "Content-Type": "application/json"
             }
           }
           EOF
@@ -140,12 +156,20 @@ jobs:
             -H "X-GitHub-Event: sync" \
             -H "User-Agent: GitHub-Actions-Sync" \
             -d "$PAYLOAD" \
-            "${{ env.WEBHOOK_URL }}/webhook/github")
+            "${{ env.WEBHOOK_URL }}/trigger")
           
           if [ "$HTTP_STATUS" = "200" ]; then
             echo "✅ Successfully triggered CDM ingestion webhook"
           else
-            echo "⚠️ Webhook returned status $HTTP_STATUS, but sync completed"
+            echo "❌ Webhook failed with status $HTTP_STATUS"
+            echo "Response body:"
+            curl -X POST \
+              -H "Content-Type: application/json" \
+              -H "X-GitHub-Event: sync" \
+              -H "User-Agent: GitHub-Actions-Sync" \
+              -d "$PAYLOAD" \
+              "${{ env.WEBHOOK_URL }}/trigger"
+            exit 1
           fi
 
       - name: Summary
