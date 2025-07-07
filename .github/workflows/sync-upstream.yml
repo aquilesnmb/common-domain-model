@@ -1,0 +1,169 @@
+name: Sync with Upstream CDM Repository
+
+on:
+  schedule:
+    # Run every 2 hours
+    - cron: '0 */2 * * *'
+  workflow_dispatch:  # Allow manual triggering
+  
+env:
+  WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+  UPSTREAM_REPO: finos/common-domain-model
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: ${{ env.FORK_BRANCH }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git remote -v
+
+      - name: Fetch upstream changes
+        run: |
+          echo "Fetching upstream changes..."
+          git fetch upstream
+          
+          # Get commit counts for comparison
+          UPSTREAM_COMMIT=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+          FORK_COMMIT=$(git rev-parse HEAD)
+          
+          echo "Upstream commit: $UPSTREAM_COMMIT"
+          echo "Fork commit: $FORK_COMMIT"
+          
+          # Check if there are new commits
+          if [ "$UPSTREAM_COMMIT" = "$FORK_COMMIT" ]; then
+            echo "No new commits to sync"
+            echo "HAS_CHANGES=false" >> $GITHUB_ENV
+          else
+            echo "New commits found"
+            echo "HAS_CHANGES=true" >> $GITHUB_ENV
+            echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> $GITHUB_ENV
+            echo "FORK_COMMIT=$FORK_COMMIT" >> $GITHUB_ENV
+            
+            # Get commit count and changed files
+            COMMIT_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }})
+            echo "COMMIT_COUNT=$COMMIT_COUNT" >> $GITHUB_ENV
+            
+            # Get list of changed files
+            CHANGED_FILES=$(git diff --name-only HEAD..upstream/${{ env.UPSTREAM_BRANCH }} | head -20)
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            
+            # Filter for CDM-relevant files
+            RELEVANT_FILES=$(echo "$CHANGED_FILES" | grep -E '\.(rosetta|json|md|txt|py|yaml|yml)$|^(rosetta-source|docs|examples|schemas|website)/' | head -10 || true)
+            echo "Relevant files:"
+            echo "$RELEVANT_FILES"
+          fi
+
+      - name: Sync with upstream
+        if: env.HAS_CHANGES == 'true'
+        run: |
+          echo "Syncing ${{ env.COMMIT_COUNT }} commits from upstream..."
+          
+          # Attempt to merge upstream changes
+          if git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit; then
+            echo "✅ Successfully merged upstream changes"
+            echo "SYNC_STATUS=success" >> $GITHUB_ENV
+          else
+            echo "⚠️ Merge conflicts detected, attempting to resolve..."
+            
+            # For CDM repository, we'll favor upstream changes for most conflicts
+            git status --porcelain | grep "^UU" | cut -c4- | while read file; do
+              echo "Resolving conflict in $file by favoring upstream"
+              git checkout upstream/${{ env.UPSTREAM_BRANCH }} -- "$file"
+            done
+            
+            # Commit the resolved merge
+            git add .
+            git commit -m "Resolved merge conflicts by favoring upstream changes"
+            echo "SYNC_STATUS=conflict_resolved" >> $GITHUB_ENV
+          fi
+
+      - name: Push changes to fork
+        if: env.HAS_CHANGES == 'true'
+        run: |
+          echo "Pushing changes to fork..."
+          git push origin ${{ env.FORK_BRANCH }}
+          echo "✅ Successfully pushed changes to fork"
+
+      - name: Trigger CDM Ingestion Webhook
+        if: env.HAS_CHANGES == 'true' && env.WEBHOOK_URL != ''
+        run: |
+          echo "Triggering CDM ingestion webhook..."
+          
+          # Prepare webhook payload
+          PAYLOAD=$(cat <<EOF
+          {
+            "action": "upstream_sync",
+            "repository": {
+              "full_name": "${{ github.repository }}",
+              "default_branch": "${{ env.FORK_BRANCH }}"
+            },
+            "sync_info": {
+              "before": "${{ env.FORK_COMMIT }}",
+              "after": "${{ env.UPSTREAM_COMMIT }}",
+              "commits_synced": ${{ env.COMMIT_COUNT }},
+              "sync_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "sync_status": "${{ env.SYNC_STATUS }}"
+            },
+            "commits_synced": ${{ env.COMMIT_COUNT }},
+            "sync_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "workflow_run": {
+              "id": "${{ github.run_id }}",
+              "number": "${{ github.run_number }}",
+              "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+          }
+          EOF
+          )
+          
+          # Send webhook
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-GitHub-Event: sync" \
+            -H "User-Agent: GitHub-Actions-Sync" \
+            -d "$PAYLOAD" \
+            "${{ env.WEBHOOK_URL }}/webhook/github")
+          
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "✅ Successfully triggered CDM ingestion webhook"
+          else
+            echo "⚠️ Webhook returned status $HTTP_STATUS, but sync completed"
+          fi
+
+      - name: Summary
+        run: |
+          echo "## 📊 Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Repository**: ${{ env.UPSTREAM_REPO }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fork Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ env.FORK_BRANCH }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync Time**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ env.HAS_CHANGES }}" = "true" ]; then
+            echo "- **Status**: ✅ Synced ${{ env.COMMIT_COUNT }} commits" >> $GITHUB_STEP_SUMMARY
+            echo "- **From**: ${{ env.FORK_COMMIT }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **To**: ${{ env.UPSTREAM_COMMIT }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Webhook**: $([ -n '${{ env.WEBHOOK_URL }}' ] && echo 'Triggered' || echo 'Not configured')" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: ℹ️ No changes to sync" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "- **Next Sync**: In 2 hours (automatic)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Manual Trigger**: Available in Actions tab" >> $GITHUB_STEP_SUMMARY 
