@@ -9,8 +9,8 @@ on:
 env:
   WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
   UPSTREAM_REPO: finos/common-domain-model
-  UPSTREAM_BRANCH: main
-  FORK_BRANCH: main
+  UPSTREAM_BRANCH: master
+  FORK_BRANCH: master
 
 jobs:
   sync-upstream:
