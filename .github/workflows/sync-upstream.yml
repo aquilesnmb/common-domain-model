@@ -37,27 +37,28 @@ jobs:
       - name: Fetch upstream changes
         run: |
           echo "Fetching upstream changes..."
-          git fetch upstream
           
-          # Get commit counts for comparison
+          # Fetch all branches, tags, and releases from upstream
+          echo "Fetching all upstream branches and tags..."
+          git fetch upstream --all --tags --prune
+          
+          # Get commit counts for comparison (main branch)
           UPSTREAM_COMMIT=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
           FORK_COMMIT=$(git rev-parse HEAD)
           
           echo "Upstream commit: $UPSTREAM_COMMIT"
           echo "Fork commit: $FORK_COMMIT"
           
-          # Check if there are new commits
+          # Check for new commits in main branch
           if [ "$UPSTREAM_COMMIT" = "$FORK_COMMIT" ]; then
-            echo "No new commits to sync"
-            echo "HAS_CHANGES=false" >> $GITHUB_ENV
+            echo "No new commits in main branch"
+            BRANCH_CHANGES=false
           else
-            echo "New commits found"
-            echo "HAS_CHANGES=true" >> $GITHUB_ENV
-            echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> $GITHUB_ENV
-            echo "FORK_COMMIT=$FORK_COMMIT" >> $GITHUB_ENV
+            echo "New commits found in main branch"
+            BRANCH_CHANGES=true
             
             # Get commit count and changed files
-            COMMIT_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }})
+            COMMIT_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }} 2>/dev/null || echo "0")
             echo "COMMIT_COUNT=$COMMIT_COUNT" >> $GITHUB_ENV
             
             # Get list of changed files
@@ -70,124 +71,212 @@ jobs:
             echo "Relevant files:"
             echo "$RELEVANT_FILES"
           fi
-
-      - name: Sync with upstream
-        if: env.HAS_CHANGES == 'true'
-        run: |
-          echo "Syncing ${{ env.COMMIT_COUNT }} commits from upstream..."
           
-          # Attempt to merge upstream changes
-          if git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit; then
-            echo "✅ Successfully merged upstream changes"
-            echo "SYNC_STATUS=success" >> $GITHUB_ENV
+          # Check for new tags
+          echo "Checking for new tags..."
+          LOCAL_TAGS=$(git tag | sort -V | tail -5)
+          UPSTREAM_TAGS=$(git tag -l | grep -E '^v?[0-9]+\.[0-9]+' | sort -V | tail -5)
+          
+          echo "Local tags (last 5):"
+          echo "$LOCAL_TAGS"
+          echo "Upstream tags (last 5):"
+          echo "$UPSTREAM_TAGS"
+          
+          # Check for new tags
+          NEW_TAGS=$(git tag -l | grep -E '^v?[0-9]+\.[0-9]+' | sort -V | tail -10)
+          if [ -n "$NEW_TAGS" ]; then
+            echo "Found tags to sync:"
+            echo "$NEW_TAGS"
+            TAG_CHANGES=true
           else
-            echo "⚠️ Merge conflicts detected, attempting to resolve..."
-            
-            # For CDM repository, we'll favor upstream changes for most conflicts
-            git status --porcelain | grep "^UU" | cut -c4- | while read file; do
-              echo "Resolving conflict in $file by favoring upstream"
-              git checkout upstream/${{ env.UPSTREAM_BRANCH }} -- "$file"
-            done
-            
-            # Commit the resolved merge
-            git add .
-            git commit -m "Resolved merge conflicts by favoring upstream changes"
-            echo "SYNC_STATUS=conflict_resolved" >> $GITHUB_ENV
+            echo "No new tags found"
+            TAG_CHANGES=false
           fi
+          
+          # Check for new branches
+          echo "Checking for new branches..."
+          UPSTREAM_BRANCHES=$(git branch -r | grep upstream/ | grep -v HEAD | sed 's/.*upstream\///' | head -10)
+          echo "Upstream branches:"
+          echo "$UPSTREAM_BRANCHES"
+          
+          # Determine if we have any changes
+          if [ "$BRANCH_CHANGES" = true ] || [ "$TAG_CHANGES" = true ]; then
+            echo "HAS_CHANGES=true" >> $GITHUB_ENV
+            echo "BRANCH_CHANGES=$BRANCH_CHANGES" >> $GITHUB_ENV
+            echo "TAG_CHANGES=$TAG_CHANGES" >> $GITHUB_ENV
+          else
+            echo "HAS_CHANGES=false" >> $GITHUB_ENV
+          fi
+          
+          echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> $GITHUB_ENV
+          echo "FORK_COMMIT=$FORK_COMMIT" >> $GITHUB_ENV
 
-      - name: Push changes to fork
+      - name: Prepare trigger data
         if: env.HAS_CHANGES == 'true'
         run: |
-          echo "Pushing changes to fork..."
-          git push origin ${{ env.FORK_BRANCH }}
-          echo "✅ Successfully pushed changes to fork"
+          echo "Preparing trigger data for Step Functions pipeline..."
+          
+          # Set trigger status
+          echo "SYNC_STATUS=trigger_ready" >> $GITHUB_ENV
+          echo "SYNC_DETAILS=Detected changes - triggering Step Functions pipeline for sync and ingestion" >> $GITHUB_ENV
+          
+          # Log what will be triggered
+          if [ "${{ env.BRANCH_CHANGES }}" = "true" ]; then
+            echo "📋 Will trigger pipeline for ${{ env.COMMIT_COUNT }} new commits in master branch"
+          fi
+          
+          if [ "${{ env.TAG_CHANGES }}" = "true" ]; then
+            echo "📋 Will trigger pipeline for ${{ env.TAG_COUNT }} new tags"
+          fi
+          
+          echo "🚀 Step Functions pipeline will handle the actual sync and ingestion"
 
-      - name: Trigger CDM Ingestion Webhook
+
+
+      - name: Install jq (if not available)
         if: env.HAS_CHANGES == 'true' && env.WEBHOOK_URL != ''
         run: |
-          echo "Triggering CDM ingestion webhook..."
+          if ! command -v jq &> /dev/null; then
+            echo "Installing jq..."
+            sudo apt-get update && sudo apt-get install -y jq
+          else
+            echo "jq is already installed"
+          fi
           
-          # Prepare webhook payload for API Gateway Lambda proxy integration
-          WEBHOOK_BODY=$(cat <<EOF
+      - name: Trigger CDM Ingestion Step Functions Pipeline
+        if: env.HAS_CHANGES == 'true' && env.WEBHOOK_URL != ''
+        run: |
+          echo "🚀 Triggering CDM ingestion Step Functions pipeline..."
+          
+          # Validate webhook URL
+          if [ -z "${{ env.WEBHOOK_URL }}" ]; then
+            echo "❌ WEBHOOK_URL is empty"
+            exit 1
+          fi
+          
+          echo "Webhook URL: ${{ env.WEBHOOK_URL }}/trigger"
+          
+          # Generate timestamp once
+          TRIGGER_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "Trigger timestamp: $TRIGGER_TIMESTAMP"
+          
+          # Debug environment variables
+          echo "Debug info:"
+          echo "- UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}"
+          echo "- UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}"
+          echo "- FORK_REPO: ${{ github.repository }}"
+          echo "- FORK_BRANCH: ${{ env.FORK_BRANCH }}"
+          echo "- FORK_COMMIT: ${{ env.FORK_COMMIT }}"
+          echo "- UPSTREAM_COMMIT: ${{ env.UPSTREAM_COMMIT }}"
+          echo "- COMMIT_COUNT: ${{ env.COMMIT_COUNT }}"
+          echo "- BRANCH_CHANGES: ${{ env.BRANCH_CHANGES }}"
+          echo "- TAG_CHANGES: ${{ env.TAG_CHANGES }}"
+          
+          # Create webhook payload for Step Functions trigger
+          WEBHOOK_PAYLOAD=$(cat <<EOF
           {
-            "action": "upstream_sync",
+            "action": "upstream_changes_detected",
+            "trigger_source": "github_actions",
             "repository": {
-              "full_name": "${{ github.repository }}",
-              "default_branch": "${{ env.FORK_BRANCH }}"
+              "upstream_repo": "${{ env.UPSTREAM_REPO }}",
+              "upstream_branch": "${{ env.UPSTREAM_BRANCH }}",
+              "fork_repo": "${{ github.repository }}",
+              "fork_branch": "${{ env.FORK_BRANCH }}"
             },
-            "sync_info": {
-              "before": "${{ env.FORK_COMMIT }}",
-              "after": "${{ env.UPSTREAM_COMMIT }}",
-              "commits_synced": ${{ env.COMMIT_COUNT }},
-              "sync_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-              "sync_status": "${{ env.SYNC_STATUS }}"
+            "changes_detected": {
+              "has_branch_changes": ${{ env.BRANCH_CHANGES }},
+              "has_tag_changes": ${{ env.TAG_CHANGES }},
+              "commits_to_sync": ${{ env.COMMIT_COUNT }},
+              "tags_to_sync": ${{ env.TAG_COUNT }},
+              "before_commit": "${{ env.FORK_COMMIT }}",
+              "after_commit": "${{ env.UPSTREAM_COMMIT }}"
             },
-            "before": "${{ env.FORK_COMMIT }}",
-            "after": "${{ env.UPSTREAM_COMMIT }}",
-            "commits_synced": ${{ env.COMMIT_COUNT }},
-            "sync_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "workflow_run": {
-              "id": "${{ github.run_id }}",
-              "number": "${{ github.run_number }}",
-              "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            "trigger_info": {
+              "trigger_timestamp": "$TRIGGER_TIMESTAMP",
+              "trigger_reason": "$([ '${{ env.BRANCH_CHANGES }}' = 'true' ] && echo 'branch_changes' || echo 'tag_changes')",
+              "github_workflow": {
+                "run_id": "${{ github.run_id }}",
+                "run_number": "${{ github.run_number }}",
+                "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              }
             }
           }
           EOF
           )
           
-          # Create API Gateway Lambda proxy event structure
-          PAYLOAD=$(cat <<EOF
-          {
-            "source": "webhook",
-            "body": $(echo "$WEBHOOK_BODY" | jq -c -R .),
-            "headers": {
-              "X-GitHub-Event": "sync",
-              "User-Agent": "GitHub-Actions-Sync",
-              "Content-Type": "application/json"
-            }
-          }
-          EOF
-          )
+          # Validate JSON structure
+          echo "Validating JSON payload..."
+          if ! echo "$WEBHOOK_PAYLOAD" | jq . > /dev/null 2>&1; then
+            echo "❌ Invalid JSON payload structure"
+            echo "Payload:"
+            echo "$WEBHOOK_PAYLOAD"
+            exit 1
+          fi
           
-          # Send webhook
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          echo "✅ JSON payload is valid"
+          
+          # Debug: Show the payload (first 500 chars)
+          echo "Payload preview:"
+          echo "$WEBHOOK_PAYLOAD" | head -c 500
+          echo "..."
+          
+          # Send webhook directly (no API Gateway proxy wrapper needed)
+          echo "Sending webhook request..."
+          HTTP_STATUS=$(curl -s -o /tmp/webhook_response.json -w "%{http_code}" \
             -X POST \
             -H "Content-Type: application/json" \
             -H "X-GitHub-Event: sync" \
             -H "User-Agent: GitHub-Actions-Sync" \
-            -d "$PAYLOAD" \
+            -d "$WEBHOOK_PAYLOAD" \
             "${{ env.WEBHOOK_URL }}/trigger")
           
-          if [ "$HTTP_STATUS" = "200" ]; then
-            echo "✅ Successfully triggered CDM ingestion webhook"
+          echo "HTTP Status: $HTTP_STATUS"
+          
+          if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "202" ]; then
+            echo "✅ Successfully triggered CDM ingestion Step Functions pipeline"
+            if [ -f /tmp/webhook_response.json ]; then
+              echo "Pipeline response:"
+              cat /tmp/webhook_response.json
+            fi
           else
-            echo "❌ Webhook failed with status $HTTP_STATUS"
+            echo "❌ Step Functions pipeline trigger failed with status $HTTP_STATUS"
             echo "Response body:"
-            curl -X POST \
+            if [ -f /tmp/webhook_response.json ]; then
+              cat /tmp/webhook_response.json
+            fi
+            
+            # Try to get more details
+            echo "Detailed curl output:"
+            curl -v -X POST \
               -H "Content-Type: application/json" \
               -H "X-GitHub-Event: sync" \
               -H "User-Agent: GitHub-Actions-Sync" \
-              -d "$PAYLOAD" \
+              -d "$WEBHOOK_PAYLOAD" \
               "${{ env.WEBHOOK_URL }}/trigger"
             exit 1
           fi
 
       - name: Summary
         run: |
-          echo "## 📊 Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Change Detection & Trigger Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Upstream Repository**: ${{ env.UPSTREAM_REPO }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Fork Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Branch**: ${{ env.FORK_BRANCH }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Sync Time**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Check Time**: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ env.HAS_CHANGES }}" = "true" ]; then
-            echo "- **Status**: ✅ Synced ${{ env.COMMIT_COUNT }} commits" >> $GITHUB_STEP_SUMMARY
-            echo "- **From**: ${{ env.FORK_COMMIT }}" >> $GITHUB_STEP_SUMMARY
-            echo "- **To**: ${{ env.UPSTREAM_COMMIT }}" >> $GITHUB_STEP_SUMMARY
-            echo "- **Webhook**: $([ -n '${{ env.WEBHOOK_URL }}' ] && echo 'Triggered' || echo 'Not configured')" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status**: 🚀 Changes detected - Step Functions pipeline triggered" >> $GITHUB_STEP_SUMMARY
+            echo "- **Commits Detected**: ${{ env.COMMIT_COUNT }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Tags Detected**: ${{ env.TAG_COUNT }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Branch Changes**: ${{ env.BRANCH_CHANGES }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Tag Changes**: ${{ env.TAG_CHANGES }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Before Commit**: ${{ env.FORK_COMMIT }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **After Commit**: ${{ env.UPSTREAM_COMMIT }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Pipeline Trigger**: $([ -n '${{ env.WEBHOOK_URL }}' ] && echo '✅ Triggered' || echo '❌ Not configured')" >> $GITHUB_STEP_SUMMARY
+            echo "- **Note**: The Step Functions pipeline will handle the actual sync and ingestion" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- **Status**: ℹ️ No changes to sync" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status**: ℹ️ No changes detected" >> $GITHUB_STEP_SUMMARY
           fi
           
-          echo "- **Next Sync**: In 2 hours (automatic)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Next Check**: In 2 hours (automatic)" >> $GITHUB_STEP_SUMMARY
           echo "- **Manual Trigger**: Available in Actions tab" >> $GITHUB_STEP_SUMMARY 
