@@ -38,11 +38,38 @@ jobs:
         run: |
           echo "Fetching upstream changes..."
           
+          # Verify upstream remote exists
+          if ! git remote get-url upstream >/dev/null 2>&1; then
+            echo "❌ Upstream remote not found"
+            exit 1
+          fi
+          
+          echo "Upstream remote URL: $(git remote get-url upstream)"
+          
           # Fetch all branches, tags, and releases from upstream
           echo "Fetching all upstream branches and tags..."
-          git fetch upstream --all --tags --prune
+          
+          # Fetch tags first
+          echo "Fetching tags..."
+          git fetch upstream --tags --prune
+          
+          # Fetch all branches
+          echo "Fetching branches..."
+          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*'
+          
+          echo "✅ Successfully fetched upstream changes"
           
           # Get commit counts for comparison (main branch)
+          echo "Checking commits on branch: ${{ env.UPSTREAM_BRANCH }}"
+          
+          # Verify upstream branch exists
+          if ! git rev-parse --verify upstream/${{ env.UPSTREAM_BRANCH }} >/dev/null 2>&1; then
+            echo "❌ Upstream branch '${{ env.UPSTREAM_BRANCH }}' not found"
+            echo "Available upstream branches:"
+            git branch -r | grep upstream/ | head -10
+            exit 1
+          fi
+          
           UPSTREAM_COMMIT=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
           FORK_COMMIT=$(git rev-parse HEAD)
           
@@ -59,6 +86,13 @@ jobs:
             
             # Get commit count and changed files
             COMMIT_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }} 2>/dev/null || echo "0")
+            
+            # Ensure COMMIT_COUNT is a valid number
+            if ! [[ "$COMMIT_COUNT" =~ ^[0-9]+$ ]]; then
+              echo "Warning: Invalid commit count '$COMMIT_COUNT', setting to 0"
+              COMMIT_COUNT=0
+            fi
+            
             echo "COMMIT_COUNT=$COMMIT_COUNT" >> $GITHUB_ENV
             
             # Get list of changed files
@@ -74,24 +108,36 @@ jobs:
           
           # Check for new tags
           echo "Checking for new tags..."
-          LOCAL_TAGS=$(git tag | sort -V | tail -5)
-          UPSTREAM_TAGS=$(git tag -l | grep -E '^v?[0-9]+\.[0-9]+' | sort -V | tail -5)
           
-          echo "Local tags (last 5):"
-          echo "$LOCAL_TAGS"
-          echo "Upstream tags (last 5):"
-          echo "$UPSTREAM_TAGS"
+          # Get all tags (both local and fetched from upstream)
+          ALL_TAGS=$(git tag -l | sort -V)
+          VERSION_TAGS=$(echo "$ALL_TAGS" | grep -E '^v?[0-9]+\.[0-9]+' | sort -V)
           
-          # Check for new tags
-          NEW_TAGS=$(git tag -l | grep -E '^v?[0-9]+\.[0-9]+' | sort -V | tail -10)
-          if [ -n "$NEW_TAGS" ]; then
-            echo "Found tags to sync:"
-            echo "$NEW_TAGS"
+          echo "All tags found:"
+          echo "$ALL_TAGS"
+          echo "Version tags (last 10):"
+          echo "$VERSION_TAGS" | tail -10
+          
+          # Count total tags for comparison
+          if [ -n "$VERSION_TAGS" ] && [ "$VERSION_TAGS" != "" ]; then
+            TAG_COUNT=$(echo "$VERSION_TAGS" | wc -l)
+          else
+            TAG_COUNT=0
+          fi
+          
+          echo "Total version tags: $TAG_COUNT"
+          
+          # For now, assume we have tag changes if we have any version tags
+          # In a real scenario, you'd compare with a previous state
+          if [ "$TAG_COUNT" -gt 0 ]; then
+            echo "Found $TAG_COUNT version tags"
             TAG_CHANGES=true
           else
-            echo "No new tags found"
+            echo "No version tags found"
             TAG_CHANGES=false
           fi
+          
+          echo "TAG_COUNT=$TAG_COUNT" >> $GITHUB_ENV
           
           # Check for new branches
           echo "Checking for new branches..."
@@ -110,6 +156,15 @@ jobs:
           
           echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> $GITHUB_ENV
           echo "FORK_COMMIT=$FORK_COMMIT" >> $GITHUB_ENV
+          
+          # Debug output
+          echo "=== DEBUG SUMMARY ==="
+          echo "HAS_CHANGES: $([ "$BRANCH_CHANGES" = true ] || [ "$TAG_CHANGES" = true ] && echo true || echo false)"
+          echo "BRANCH_CHANGES: $BRANCH_CHANGES"
+          echo "TAG_CHANGES: $TAG_CHANGES"
+          echo "COMMIT_COUNT: ${COMMIT_COUNT:-0}"
+          echo "TAG_COUNT: ${TAG_COUNT:-0}"
+          echo "===================="
 
       - name: Prepare trigger data
         if: env.HAS_CHANGES == 'true'
