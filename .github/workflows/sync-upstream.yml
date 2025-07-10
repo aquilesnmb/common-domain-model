@@ -236,36 +236,60 @@ jobs:
           echo "- TAG_CHANGES: ${{ env.TAG_CHANGES }}"
           
           # Create webhook payload for Step Functions trigger
-          # Based on the Lambda handler, it expects either a direct payload or API Gateway format
-          WEBHOOK_PAYLOAD=$(cat <<EOF
+          # Use multiple payload formats to ensure compatibility
+          
+          # Try format 1: Direct Step Functions trigger format
+          WEBHOOK_PAYLOAD_V1=$(cat <<EOF
           {
-            "trigger_type": "github_actions_sync",
+            "trigger_type": "fork_sync",
             "source": "github_actions",
-            "action": "upstream_changes_detected",
             "repository": "${{ env.UPSTREAM_REPO }}",
             "branch": "${{ env.UPSTREAM_BRANCH }}",
-            "fork_repository": "${{ github.repository }}",
-            "fork_branch": "${{ env.FORK_BRANCH }}",
-            "changes_detected": {
-              "has_branch_changes": ${{ env.BRANCH_CHANGES }},
-              "has_tag_changes": ${{ env.TAG_CHANGES }},
-              "commits_to_sync": ${{ env.COMMIT_COUNT }},
-              "tags_to_sync": ${{ env.TAG_COUNT }},
-              "before_commit": "${{ env.FORK_COMMIT }}",
-              "after_commit": "${{ env.UPSTREAM_COMMIT }}"
-            },
-            "trigger_info": {
-              "trigger_timestamp": "$TRIGGER_TIMESTAMP",
-              "trigger_reason": "$([ '${{ env.BRANCH_CHANGES }}' = 'true' ] && echo 'branch_changes' || echo 'tag_changes')",
-              "github_workflow": {
-                "run_id": "${{ github.run_id }}",
-                "run_number": "${{ github.run_number }}",
-                "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-              }
+            "force_full_sync": false,
+            "sync_info": {
+              "before": "${{ env.FORK_COMMIT }}",
+              "after": "${{ env.UPSTREAM_COMMIT }}",
+              "commits_synced": ${{ env.COMMIT_COUNT }},
+              "sync_timestamp": "$TRIGGER_TIMESTAMP",
+              "sync_status": "success"
             }
           }
           EOF
           )
+          
+          # Try format 2: GitHub webhook format (what the handler expects)
+          WEBHOOK_PAYLOAD_V2=$(cat <<EOF
+          {
+            "action": "upstream_sync",
+            "repository": {
+              "full_name": "${{ env.UPSTREAM_REPO }}",
+              "default_branch": "${{ env.UPSTREAM_BRANCH }}"
+            },
+            "before": "${{ env.FORK_COMMIT }}",
+            "after": "${{ env.UPSTREAM_COMMIT }}",
+            "commits_synced": ${{ env.COMMIT_COUNT }},
+            "sync_timestamp": "$TRIGGER_TIMESTAMP",
+            "workflow_run": {
+              "id": "${{ github.run_id }}",
+              "number": "${{ github.run_number }}",
+              "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+          }
+          EOF
+          )
+          
+          # Try format 3: Exact format that works (based on successful manual test)
+          WEBHOOK_PAYLOAD_V3=$(cat <<EOF
+          {
+            "trigger_type": "manual",
+            "repository": "${{ env.UPSTREAM_REPO }}",
+            "branch": "${{ env.UPSTREAM_BRANCH }}"
+          }
+          EOF
+          )
+          
+          # Use the GitHub webhook format as primary
+          WEBHOOK_PAYLOAD="$WEBHOOK_PAYLOAD_V2"
           
           # Validate JSON structure
           echo "Validating JSON payload..."
@@ -310,18 +334,62 @@ jobs:
             echo ""
           fi
           
-          # Now send the actual webhook
-          echo "Sending webhook payload..."
-          HTTP_STATUS=$(curl -s -o /tmp/webhook_response.json -w "%{http_code}" \
-            --max-time 30 \
-            --retry 2 \
-            --retry-delay 5 \
-            -X POST \
-            -H "Content-Type: application/json" \
-            -H "X-GitHub-Event: sync" \
-            -H "User-Agent: GitHub-Actions-Sync" \
-            -d "$WEBHOOK_PAYLOAD" \
-            "${{ env.WEBHOOK_URL }}/trigger")
+          # Function to try webhook with different payload formats
+          try_webhook() {
+            local payload="$1"
+            local attempt_name="$2"
+            
+            echo "Trying webhook with $attempt_name format..."
+            local status=$(curl -s -o /tmp/webhook_response_${attempt_name}.json -w "%{http_code}" \
+              --max-time 30 \
+              -X POST \
+              -H "Content-Type: application/json" \
+              -H "X-GitHub-Event: sync" \
+              -H "User-Agent: GitHub-Actions-Sync" \
+              -d "$payload" \
+              "${{ env.WEBHOOK_URL }}/trigger")
+            
+            echo "$attempt_name status: $status"
+            if [ -f "/tmp/webhook_response_${attempt_name}.json" ]; then
+              echo "$attempt_name response:"
+              cat "/tmp/webhook_response_${attempt_name}.json"
+              echo ""
+              
+              # Check if this attempt triggered Step Functions
+              local execution_arn=$(cat "/tmp/webhook_response_${attempt_name}.json" | jq -r '.execution_arn // empty' 2>/dev/null || echo "")
+              if [ -n "$execution_arn" ]; then
+                echo "✅ $attempt_name format successfully triggered Step Functions!"
+                echo "Execution ARN: $execution_arn"
+                return 0
+              fi
+            fi
+            
+            return 1
+          }
+          
+                     # Try the format we KNOW works first (manual trigger format)
+           if try_webhook "$WEBHOOK_PAYLOAD_V3" "manual_trigger"; then
+             HTTP_STATUS=200
+             cp /tmp/webhook_response_manual_trigger.json /tmp/webhook_response.json
+           # If that fails, try GitHub webhook format
+           elif try_webhook "$WEBHOOK_PAYLOAD_V2" "github_webhook"; then
+             HTTP_STATUS=200
+             cp /tmp/webhook_response_github_webhook.json /tmp/webhook_response.json
+           # If that fails, try Step Functions format
+           elif try_webhook "$WEBHOOK_PAYLOAD_V1" "step_functions"; then
+             HTTP_STATUS=200
+             cp /tmp/webhook_response_step_functions.json /tmp/webhook_response.json
+           else
+             echo "❌ All webhook formats failed, using last response..."
+             HTTP_STATUS=$(curl -s -o /tmp/webhook_response.json -w "%{http_code}" \
+               --max-time 30 \
+               -X POST \
+               -H "Content-Type: application/json" \
+               -H "X-GitHub-Event: sync" \
+               -H "User-Agent: GitHub-Actions-Sync" \
+               -d "$WEBHOOK_PAYLOAD_V3" \
+               "${{ env.WEBHOOK_URL }}/trigger")
+           fi
           
           echo "HTTP Status: $HTTP_STATUS"
           
