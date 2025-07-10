@@ -209,7 +209,15 @@ jobs:
             exit 1
           fi
           
+          # Validate URL format
+          if [[ ! "${{ env.WEBHOOK_URL }}" =~ ^https?:// ]]; then
+            echo "❌ WEBHOOK_URL must start with http:// or https://"
+            echo "Current value: ${{ env.WEBHOOK_URL }}"
+            exit 1
+          fi
+          
           echo "Webhook URL: ${{ env.WEBHOOK_URL }}/trigger"
+          echo "Full webhook endpoint: ${{ env.WEBHOOK_URL }}/trigger"
           
           # Generate timestamp once
           TRIGGER_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -228,16 +236,16 @@ jobs:
           echo "- TAG_CHANGES: ${{ env.TAG_CHANGES }}"
           
           # Create webhook payload for Step Functions trigger
+          # Based on the Lambda handler, it expects either a direct payload or API Gateway format
           WEBHOOK_PAYLOAD=$(cat <<EOF
           {
+            "trigger_type": "github_actions_sync",
+            "source": "github_actions",
             "action": "upstream_changes_detected",
-            "trigger_source": "github_actions",
-            "repository": {
-              "upstream_repo": "${{ env.UPSTREAM_REPO }}",
-              "upstream_branch": "${{ env.UPSTREAM_BRANCH }}",
-              "fork_repo": "${{ github.repository }}",
-              "fork_branch": "${{ env.FORK_BRANCH }}"
-            },
+            "repository": "${{ env.UPSTREAM_REPO }}",
+            "branch": "${{ env.UPSTREAM_BRANCH }}",
+            "fork_repository": "${{ github.repository }}",
+            "fork_branch": "${{ env.FORK_BRANCH }}",
             "changes_detected": {
               "has_branch_changes": ${{ env.BRANCH_CHANGES }},
               "has_tag_changes": ${{ env.TAG_CHANGES }},
@@ -277,7 +285,37 @@ jobs:
           
           # Send webhook directly (no API Gateway proxy wrapper needed)
           echo "Sending webhook request..."
+          
+          # First, test if the API Gateway is working
+          echo "Testing API Gateway health..."
+          HEALTH_STATUS=$(curl -s -o /tmp/health_test.json -w "%{http_code}" \
+            -X GET "${{ env.WEBHOOK_URL }}/health" 2>/dev/null || echo "000")
+          
+          echo "Health check status: $HEALTH_STATUS"
+          if [ -f /tmp/health_test.json ]; then
+            echo "Health response:"
+            cat /tmp/health_test.json
+            echo ""
+          fi
+          
+          # Test the trigger endpoint
+          echo "Testing trigger endpoint availability..."
+          TRIGGER_TEST_STATUS=$(curl -s -o /tmp/endpoint_test.json -w "%{http_code}" \
+            -X GET "${{ env.WEBHOOK_URL }}/trigger" 2>/dev/null || echo "000")
+          
+          echo "Trigger endpoint test status: $TRIGGER_TEST_STATUS"
+          if [ -f /tmp/endpoint_test.json ]; then
+            echo "Trigger endpoint response:"
+            cat /tmp/endpoint_test.json
+            echo ""
+          fi
+          
+          # Now send the actual webhook
+          echo "Sending webhook payload..."
           HTTP_STATUS=$(curl -s -o /tmp/webhook_response.json -w "%{http_code}" \
+            --max-time 30 \
+            --retry 2 \
+            --retry-delay 5 \
             -X POST \
             -H "Content-Type: application/json" \
             -H "X-GitHub-Event: sync" \
@@ -287,20 +325,31 @@ jobs:
           
           echo "HTTP Status: $HTTP_STATUS"
           
+          echo "Response received with status: $HTTP_STATUS"
+          
+          # Always show the response for debugging
+          if [ -f /tmp/webhook_response.json ]; then
+            echo "Response body:"
+            cat /tmp/webhook_response.json
+            echo ""
+          fi
+          
           if [ "$HTTP_STATUS" = "200" ] || [ "$HTTP_STATUS" = "202" ]; then
             echo "✅ Successfully triggered CDM ingestion Step Functions pipeline"
+            
+            # Check if response contains execution_arn (indicates Step Functions was triggered)
             if [ -f /tmp/webhook_response.json ]; then
-              echo "Pipeline response:"
-              cat /tmp/webhook_response.json
+              EXECUTION_ARN=$(cat /tmp/webhook_response.json | jq -r '.execution_arn // empty' 2>/dev/null || echo "")
+              if [ -n "$EXECUTION_ARN" ]; then
+                echo "🚀 Step Functions execution started: $EXECUTION_ARN"
+              else
+                echo "⚠️  Response doesn't contain execution_arn - pipeline may not have started"
+              fi
             fi
           else
             echo "❌ Step Functions pipeline trigger failed with status $HTTP_STATUS"
-            echo "Response body:"
-            if [ -f /tmp/webhook_response.json ]; then
-              cat /tmp/webhook_response.json
-            fi
             
-            # Try to get more details
+            # Try to get more details with verbose output
             echo "Detailed curl output:"
             curl -v -X POST \
               -H "Content-Type: application/json" \
